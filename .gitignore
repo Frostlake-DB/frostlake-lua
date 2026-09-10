@@ -1,0 +1,6 @@
+/results/
+*.log
+*.rock
+/luarocks/
+/.luarocks/
+.idea
