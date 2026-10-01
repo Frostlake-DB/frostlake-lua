@@ -15,6 +15,15 @@ local function connect(handler, dsn, options)
     return frostlake.connect(dsn or DSN, options), backend
 end
 
+-- The multiStatementCount the driver's last /api/execute request carried, or
+-- nil when it carried none at all.
+local function declaredcount(backend)
+    local body = frostlake.json.parse(backend.requests[#backend.requests].body)
+    local field = frostlake.json.at(body, "multiStatementCount")
+    if frostlake.json.kind(field) ~= "number" then return nil end
+    return tonumber(field.text)
+end
+
 -- The SQL of every /api/execute request the driver sent, in order.
 local function statements(backend)
     local out = {}
@@ -120,6 +129,45 @@ t.it("keeps the session id across statements", function()
     t.eq(frostlake.json.textat(last, "sessionId"), "S7")
 end)
 
+t.it("sends no statement count when the caller asked for none", function()
+    -- The field is left out entirely, not sent as 0 or null: a request without
+    -- it is the one the engine has always seen, and the session's
+    -- MULTI_STATEMENT_COUNT decides.
+    local conn, backend = connect(fakebackend.always({ body = fakebackend.acknowledged("S1") }))
+    conn:execute("SELECT 1")
+    local body = frostlake.json.parse(backend.requests[#backend.requests].body)
+    t.eq(frostlake.json.kind(frostlake.json.at(body, "multiStatementCount")), "missing")
+end)
+
+t.it("sends the statement count this one request declares", function()
+    local conn, backend = connect(fakebackend.always({ body = fakebackend.acknowledged("S1") }))
+    conn:executeall("SELECT 1; SELECT 2", nil, { multistatementcount = 2 })
+    t.eq(declaredcount(backend), 2)
+    -- Nothing but the pack itself went out: the count rides on the request, so
+    -- there is no ALTER SESSION to send and none to undo afterwards.
+    t.same(statements(backend), { "SELECT 1; SELECT 2" })
+end)
+
+t.it("sends a count of 0, which is how a pack asks for any number", function()
+    local conn, backend = connect(fakebackend.always({ body = fakebackend.acknowledged("S1") }))
+    conn:executeall("SELECT 1; SELECT 2; SELECT 3", nil, { multistatementcount = 0 })
+    t.eq(declaredcount(backend), 0)
+end)
+
+t.it("declares the count on that one request only", function()
+    local conn, backend = connect(fakebackend.always({ body = fakebackend.acknowledged("S1") }))
+    conn:executeall("SELECT 1; SELECT 2", nil, { multistatementcount = 2 })
+    conn:execute("SELECT 3")
+    t.eq(declaredcount(backend), nil, "the next statement declares nothing")
+end)
+
+t.it("refuses a statement count that is not a whole number of statements", function()
+    local conn = connect(fakebackend.always({ body = fakebackend.acknowledged("S1") }))
+    t.raises("usage", conn.executeall, conn, "SELECT 1", nil, { multistatementcount = -1 })
+    t.raises("usage", conn.executeall, conn, "SELECT 1", nil, { multistatementcount = 1.5 })
+    t.raises("usage", conn.executeall, conn, "SELECT 1", nil, { multistatementcount = "2" })
+end)
+
 t.it("does not drop the session when one statement fails", function()
     -- A failure answers with sessionId null, and taking that would silently
     -- start a new session for every statement after a typo.
@@ -191,6 +239,31 @@ t.it("shapes a grid into columns and rows", function()
     t.eq(r:rowcount(), 2)
     t.eq(r:get(1, "NAME"), "Ada")
     t.eq(r:datatype("ID"), "NUMBER(38,0)")
+end)
+
+t.it("reports a text or binary column's declared width, and nothing for the rest", function()
+    -- The wire carries `length` for VARCHAR and BINARY only: characters for one,
+    -- bytes for the other. An unbounded column carries the most it could hold,
+    -- so there is nothing to fall back on.
+    local conn = connect(fakebackend.always({
+        body = '{"success":true,"sessionId":"S1","resultSets":[{"columns":['
+            .. '{"name":"V9","dataType":"VARCHAR","precision":0,"scale":0,"length":9},'
+            .. '{"name":"B5","dataType":"BINARY","precision":0,"scale":0,"length":5},'
+            .. '{"name":"N","dataType":"NUMBER","precision":10,"scale":2},'
+            .. '{"name":"VU","dataType":"VARCHAR","precision":0,"scale":0,"length":16777216}],'
+            .. '"rows":[]}]}' }))
+    local columns = conn:execute("SELECT v9, b5, n, vu FROM t").columns
+    t.eq(columns[1].length, 9)
+    t.eq(columns[2].length, 5)
+    t.eq(columns[3].length, nil, "a NUMBER has no width -- nil, not 0")
+    t.eq(columns[3].precision, 10)
+    t.eq(columns[4].length, 16777216)
+end)
+
+t.it("reports no width for a column an older engine sent no length for", function()
+    local conn = connect(fakebackend.always({ body = fakebackend.grid(
+        { { "S", "VARCHAR" } }, { { "x" } }) }))
+    t.eq(conn:execute("SELECT s FROM t").columns[1].length, nil)
 end)
 
 t.it("hands back numeric cells as the engine's own text", function()

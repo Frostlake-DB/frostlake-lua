@@ -15,16 +15,21 @@
 -- The table has a `__tostring`, so `print(err)` and `..` still read as a
 -- message, and an error that escapes to the interpreter prints as one.
 --
--- Three kinds, and the difference between them is who has to do something:
+-- Four kinds, and the difference between them is who has to do something:
 --
---   * `usage`      -- the calling code is wrong: a malformed DSN, an unknown
---                     option, a bind count that does not match the statement.
---                     Fix the program.
---   * `connection` -- the server could not be reached, did not answer in time,
---                     or answered something that is not a Frostlake response.
---                     The statement's fate is UNKNOWN; it may well have run.
---   * `query`      -- the engine was reached, understood the statement, and
---                     refused it. The message is the engine's own.
+--   * `usage`       -- the calling code is wrong: a malformed DSN, an unknown
+--                      option, a bind count that does not match the statement.
+--                      Fix the program.
+--   * `connection`  -- the server could not be reached, did not answer in time,
+--                      or answered something that is not a Frostlake response.
+--                      The statement's fate is UNKNOWN; it may well have run.
+--   * `query`       -- the engine was reached, understood the statement, and
+--                      refused it. The message is the engine's own.
+--   * `sessionlost` -- the engine no longer holds the connection's session, and
+--                      an open transaction or a context set up on it (USE, SET,
+--                      ALTER SESSION, a temporary object) went with it. The
+--                      statement did NOT run, and the connection carries on in
+--                      a fresh session on the DSN's scope.
 --
 -- The testkit corpus leans on that last distinction: a refused statement is a
 -- test result, while a broken connection is an infrastructure failure, and a
@@ -66,6 +71,7 @@ end
 function M.usage(message, context) raise("usage", message, context) end
 function M.connection(message, context) raise("connection", message, context) end
 function M.query(message, context) raise("query", message, context) end
+function M.sessionlost(message, context) raise("sessionlost", message, context) end
 
 -- Whether a value is one of this driver's errors. Anything else caught by a
 -- `pcall` around driver code -- a bug in here, an out-of-memory -- is not, and

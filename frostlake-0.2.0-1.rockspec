@@ -1,9 +1,9 @@
 package = "frostlake"
-version = "0.1.0-1"
+version = "0.2.0-1"
 
 source = {
    url = "git+https://github.com/Frostlake-DB/frostlake-lua.git",
-   tag = "v0.1.0",
+   tag = "v0.2.0",
 }
 
 description = {
@@ -18,7 +18,7 @@ description = {
       state that carries across statements, transactions, and result cells
       handed back as the engine's own text so a NUMBER(38,0) keeps every digit.
 
-      Requires a Frostlake engine 0.0.7 or newer.
+      Requires a Frostlake engine 0.2.0 or newer.
    ]],
    homepage = "https://frostlake.dev",
    license = "Apache-2.0",

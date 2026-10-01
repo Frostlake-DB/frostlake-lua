@@ -2,8 +2,10 @@
 --
 --     lua tests/all.lua                     the unit tests
 --     JAVA_HOME=... FROSTLAKE_CLASSPATH=... lua tests/all.lua
---                                           those, plus a real engine and the
---                                           language-neutral testkit corpus
+--                                           those, plus a real engine
+--     FL_CORPUS=.../testkit JAVA_HOME=... FROSTLAKE_CLASSPATH=... lua tests/all.lua
+--                                           and the language-neutral testkit
+--                                           corpus from that directory
 --
 --     lua tests/all.lua bind                only the groups whose name contains
 --                                           "bind"
@@ -30,7 +32,7 @@ local harness = require("harness")
 
 local FILES = {
     "json_test", "dsn_test", "sql_test", "value_test", "bind_test",
-    "result_test", "http_test", "connection_test",
+    "result_test", "http_test", "connection_test", "session_test",
 }
 
 for _, name in ipairs(FILES) do
@@ -52,4 +54,7 @@ if not ok and not tostring(why):find("module 'suites_test' not found", 1, true) 
 end
 
 harness.run(arg and arg[1] or nil)
+-- A server the run started is stopped however the run was narrowed: the corpus
+-- tally stops it too, but a filter can leave that case out.
+pcall(function() require("testserver").release() end)
 os.exit(harness.report())

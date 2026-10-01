@@ -20,6 +20,10 @@ local compat = require("frostlake.compat")
 
 local M = {}
 
+-- What `post` answers when the engine refused the session id as one it does
+-- not hold: nothing ran.
+local GONE = setmetatable({}, { __tostring = function() return "session gone" end })
+
 local Connection = {}
 Connection.__index = Connection
 Connection.__name = "frostlake.connection"
@@ -113,9 +117,18 @@ function M.connect(dsn, options)
         null = nullvalue,
         useragent = options.useragent or http.USER_AGENT,
         lastused = nil,
-        -- Whether the caller has selected a scope themselves; if they have, the
-        -- DSN's defaults are no longer the whole truth about this session.
+        -- Whether a statement left behind state a fresh session would not
+        -- have: a scope the caller selected themselves (after which the DSN's
+        -- defaults are no longer the whole truth about this session), a
+        -- session variable or setting, or a temporary object.
         touched = false,
+        -- Whether the session holds an open transaction, however it was
+        -- opened: `begin`, or a BEGIN or START TRANSACTION statement.
+        opentransaction = false,
+        -- Whether the engine reports newSession, which arrived together with
+        -- requireSession and DELETE /api/sessions/{id}: nil until the first
+        -- answer that names a session settles it as true or false.
+        tracks = nil,
         busy = false,
     }, Connection)
 
@@ -164,9 +177,17 @@ end
 
 -- ------------------------------------------------------------------ closing
 
--- Releases the socket. The HTTP API has no endpoint for ending a session, so
--- the engine's own idle sweep is what reclaims the session behind it.
+-- Releases the engine session and the socket.
+--
+-- An engine that reports newSession (0.1.0 and later) is sent DELETE
+-- /api/sessions/{id}, which ends the session and rolls back a transaction left
+-- open on it. The request is a courtesy: it is bounded by the shorter of the
+-- statement timeout and five seconds, and nothing it meets is raised -- a server
+-- already gone has nothing left to release. An older engine has no such endpoint
+-- and is sent nothing; its own idle sweep reclaims the session. Releasing twice
+-- sends nothing the second time.
 function Connection:release()
+    if not self.closed then self:releasesession() end
     self.closed = true
     if self.sock then
         http.disconnect(self.backend, self.sock)
@@ -178,11 +199,60 @@ function Connection:close()
     self:release()
 end
 
+-- The most, in milliseconds, that releasing the session may take on close.
+local RELEASE_LIMIT = 5000
+
+-- A session id made safe as one URL path segment.
+local function pathsegment(text)
+    return (text:gsub("[^%w%-%._~]", function(c)
+        return string.format("%%%02X", c:byte())
+    end))
+end
+
+-- Sends DELETE /api/sessions/{id} for the session this connection holds, when
+-- the engine is known to have that endpoint. Never raises.
+function Connection:releasesession()
+    local id = self.sessionid
+    if not id or self.tracks ~= true then return end
+    local limit = RELEASE_LIMIT
+    if (self.config.timeout or 0) > 0 and self.config.timeout < limit then
+        limit = self.config.timeout
+    end
+    local bounded = {}
+    for key, item in pairs(self.config) do bounded[key] = item end
+    bounded.timeout = limit
+    if (bounded.connecttimeout or 0) <= 0 or bounded.connecttimeout > limit then
+        bounded.connecttimeout = limit
+    end
+    pcall(function()
+        if self.sock and self.backend.stale(self.sock) then
+            http.disconnect(self.backend, self.sock)
+            self.sock = nil
+        end
+        if not self.sock then self.sock = http.connect(self.backend, bounded) end
+        -- What it answers does not matter: a 404 means the session had already
+        -- gone, and anything else is not this close's to fix.
+        http.exchange(self.backend, self.sock, bounded, "DELETE",
+            "/api/sessions/" .. pathsegment(id), nil, self.useragent)
+    end)
+end
+
 local function check(self)
     if self.closed then errors.usage("the connection is closed") end
 end
 
 -- --------------------------------------------------------------- statements
+
+-- The statement count an execute option declares, checked here so a bad value
+-- is a usage error rather than a request body the engine cannot read.
+local function statementcount(given)
+    if given == nil then return nil end
+    if type(given) ~= "number" or given < 0 or given % 1 ~= 0 then
+        errors.usage("multistatementcount must be a whole number of statements, "
+            .. "0 for any number, got " .. tostring(given))
+    end
+    return given
+end
 
 -- Runs one statement and returns its first result set.
 --
@@ -193,12 +263,25 @@ end
 -- Whether `params` is read as a list of positional arguments or a table of
 -- named ones is decided by the STATEMENT: `?` markers take a list, `:name`
 -- markers take a table keyed by name.
+--
+-- `options.multistatementcount` says how many statements this one request
+-- carries; see `executeall`.
 function Connection:execute(statement, params, options)
     return (self:executeall(statement, params, options))[1]
 end
 
 -- Runs a statement string and returns every result set it produced, in order. A
 -- single statement gives a one-element list.
+--
+-- The engine refuses a request holding more statements than it was told to
+-- expect, so a pack says how many it holds:
+--
+--     conn:executeall("SELECT 1; SELECT 2", nil, {multistatementcount = 2})
+--
+-- The count travels with this one request. It outranks the session's
+-- MULTI_STATEMENT_COUNT without changing it, so there is nothing to put back
+-- afterwards, and 0 allows any number. Left out, no count is sent at all and the
+-- session's value decides.
 function Connection:executeall(statement, params, options)
     if type(statement) ~= "string" then
         errors.usage("a statement must be a string, got " .. type(statement))
@@ -207,8 +290,9 @@ function Connection:executeall(statement, params, options)
         errors.usage("execute options must be a table, got " .. type(options))
     end
     local types = options and options.types or nil
+    local count = statementcount(options and options.multistatementcount)
     local rendered = bind.render(statement, params, types, self.null)
-    return self:run(statement, rendered)
+    return self:run(statement, rendered, count)
 end
 
 -- Renders a statement with its parameters inlined, without sending it. Useful
@@ -221,7 +305,7 @@ function Connection:render(statement, params, options)
     return bind.render(statement, params, types, self.null)
 end
 
-function Connection:run(statement, rendered)
+function Connection:run(statement, rendered, multistatementcount)
     check(self)
     -- The pending USE statements and the statement itself have to reach the
     -- session as one unit. A caller who re-enters from a coroutine resumed
@@ -234,9 +318,11 @@ function Connection:run(statement, rendered)
     self.busy = true
     local ok, answer = pcall(function()
         self:restoredefaults()
+        -- The pending USE statements are one statement each, whatever this
+        -- request declares, so the count goes only on the caller's own.
         self:drainpending()
-        local decoded = self:roundtrip(rendered)
-        if sqlscan.changesscope(statement) then self.touched = true end
+        local decoded = self:roundtrip(rendered, multistatementcount)
+        self:noteeffects(statement)
         return self:shape(decoded)
     end)
     self.busy = false
@@ -244,13 +330,49 @@ function Connection:run(statement, rendered)
     return answer
 end
 
+-- Updates what the driver knows of the session once `text` has succeeded on it:
+-- whether it now holds state a fresh session would not have, and whether a
+-- transaction is open.
+--
+-- A request may hold more than one statement, and a `USE` riding behind a
+-- leading `SELECT` moves the scope just as surely as one standing alone, so
+-- every statement is examined, in order.
+function Connection:noteeffects(text)
+    for _, statement in ipairs(sqlscan.splitstatements(text)) do
+        if sqlscan.touchessession(statement) then self.touched = true end
+        local effect = sqlscan.transactioneffect(statement)
+        if effect == "begins" then
+            self.opentransaction = true
+        elseif effect == "ends" then
+            self.opentransaction = false
+        end
+    end
+end
+
 -- Each USE leaves the queue only once it has succeeded. A DSN naming a database
 -- that does not exist has to keep failing; the alternative is later statements
 -- quietly running in the default scope.
+--
+-- A session lost part way through takes whatever part of the scope was on with
+-- it, so the whole scope goes on again, on a fresh session -- once. The DSN's
+-- own USE statements are the driver's, not the caller's, so they never count as
+-- a context the caller set up.
 function Connection:drainpending()
+    local restarted = false
     while #self.pending > 0 do
-        self:roundtrip(self.pending[1])
-        table.remove(self.pending, 1)
+        local statement = self.pending[1]
+        local decoded, answer = self:post(statement)
+        if decoded ~= GONE then
+            self:accept(statement, decoded, answer)
+            table.remove(self.pending, 1)
+        elseif restarted then
+            self:dropsession()
+            errors.sessionlost("the engine refused a session it had just started",
+                { statement = statement, endpoint = self:baseurl() .. "/api/execute" })
+        else
+            restarted = true
+            self:losesession(statement)
+        end
     end
 end
 
@@ -275,18 +397,24 @@ end
 function Connection:sessionstatement(statement)
     self:restoredefaults()
     self:drainpending()
-    return self:roundtrip(statement)
+    local decoded = self:roundtrip(statement)
+    self:noteeffects(statement)
+    return decoded
 end
 
--- The engine reclaims a session once it has been idle long enough, then quietly
--- builds a fresh one for the id we keep sending -- losing the scope we
--- selected. Nothing in the reply gives it away: the id we sent is echoed back
+-- An engine before 0.1.0 reclaims a session once it has been idle long enough,
+-- then quietly builds a fresh one for the id we keep sending -- losing the scope
+-- we selected. Nothing in its reply gives it away: the id we sent is echoed back
 -- either way. So past the limit the only safe reading is that the session is
 -- new, and the DSN's defaults go back on.
+--
+-- A later engine reports newSession, and refuses a session it no longer holds
+-- rather than rebuilding it (see `recover`), so it is left out of the guessing.
 --
 -- Not once the caller has selected a scope themselves: putting our defaults
 -- over their choice is its own surprise.
 function Connection:restoredefaults()
+    if self.tracks ~= false then return end
     if #self.defaults == 0 or self.touched then return end
     local limit = self.config.idlelimit
     if limit == 0 or not self.lastused then return end
@@ -376,35 +504,158 @@ function Connection:ping()
     return true
 end
 
-function Connection:roundtrip(statement)
+-- Sends one statement and returns the decoded reply, or raises. A session the
+-- engine no longer holds is dealt with here, before anything else sees the
+-- answer: see `recover`.
+function Connection:roundtrip(statement, multistatementcount)
+    local decoded, answer = self:post(statement, multistatementcount)
+    if decoded == GONE then
+        decoded, answer = self:recover(statement, multistatementcount)
+    end
+    self:accept(statement, decoded, answer)
+    return decoded
+end
+
+-- The session id an answer names, or nil when it names none.
+local function namedsession(decoded)
+    local session = json.at(decoded, "sessionId")
+    if json.kind(session) == "string" and session.text ~= "" then return session.text end
+    return nil
+end
+
+-- One POST /api/execute, without any recovery. Answers the decoded reply and
+-- the response it came in, or GONE when the engine refused the session id as
+-- one it does not hold -- which it does only for a request that asked it to
+-- (requireSession), and then nothing ran.
+function Connection:post(statement, multistatementcount)
     local endpoint = self:baseurl() .. "/api/execute"
+    local sent = self.sessionid
     local payload = { '{"sql":', json.encodestring(statement) }
-    if self.sessionid then
+    if sent then
         payload[#payload + 1] = ',"sessionId":'
-        payload[#payload + 1] = json.encodestring(self.sessionid)
+        payload[#payload + 1] = json.encodestring(sent)
+        -- Resume this session or refuse: without it, an engine whose session
+        -- has gone runs the statement in a fresh one under the same id, at its
+        -- default scope. Only an engine known to understand the field is sent
+        -- it -- an older one's parser may refuse a field it never knew.
+        if self.tracks == true then
+            payload[#payload + 1] = ',"requireSession":true'
+        end
     end
     payload[#payload + 1] = ',"autoCommit":'
     payload[#payload + 1] = self.autocommit and "true" or "false"
+    -- Absent unless the caller asked for a count: a request without the field is
+    -- the one the server has always seen, and the session's value decides.
+    if multistatementcount then
+        payload[#payload + 1] = ',"multiStatementCount":'
+        payload[#payload + 1] = string.format("%d", multistatementcount)
+    end
     payload[#payload + 1] = "}"
 
     local answer = self:send("POST", "/api/execute", table.concat(payload))
     local decoded = self:decode(endpoint, answer)
 
+    if sent and answer.status == 404
+        and json.boolean(json.at(decoded, "success")) ~= true
+        and not namedsession(decoded) then
+        return GONE, answer
+    end
+    self:absorb(decoded, sent)
+    return decoded, answer
+end
+
+-- Takes in what an answer says of the session: the id it ran in and, from the
+-- presence of newSession, whether the engine tracks sessions at all.
+function Connection:absorb(decoded, sent)
     -- On a failure the engine answers with sessionId null, so the id is taken
     -- only when it is really there -- otherwise one bad statement would drop
     -- the session and silently start a new one.
-    local session = json.at(decoded, "sessionId")
-    if json.kind(session) == "string" and session.text ~= "" then
-        self.sessionid = session.text
+    local session = namedsession(decoded)
+    if not session then return end
+    self.sessionid = session
+    local started = json.at(decoded, "newSession")
+    if json.kind(started) == "boolean" then
+        self.tracks = true
+        if started.value == true and sent then
+            -- The engine ran the statement in a fresh session in place of ours:
+            -- whatever the old one held is gone, and the DSN's scope goes back
+            -- on before the next statement.
+            self:resetsession()
+        end
+    elseif self.tracks == nil then
+        self.tracks = false
     end
+end
 
+-- Raises the engine's refusal of `statement`, when that is what `decoded` reports.
+function Connection:accept(statement, decoded, answer)
     if json.boolean(json.at(decoded, "success")) ~= true then
         errors.query(self:failuremessage(decoded, answer),
             { statement = statement, status = answer.status,
-              sessionid = self.sessionid, endpoint = endpoint })
+              sessionid = self.sessionid, endpoint = self:baseurl() .. "/api/execute" })
     end
     self.lastused = self.backend.gettime()
-    return decoded
+end
+
+-- The engine no longer holds this connection's session -- it expired, was
+-- released, or the server restarted -- and nothing ran.
+--
+-- With a transaction or a moved context gone along with it, running the
+-- statement again would put it somewhere its author did not intend, so that is
+-- refused. Otherwise a fresh session on the DSN's scope takes over and the
+-- statement is sent once more; a second refusal is raised rather than chased.
+function Connection:recover(statement, multistatementcount)
+    self:losesession(statement)
+    self:drainpending()
+    local decoded, answer = self:post(statement, multistatementcount)
+    if decoded == GONE then
+        self:dropsession()
+        errors.sessionlost("the engine refused a session it had just started; "
+            .. "the statement did not run",
+            { statement = statement, endpoint = self:baseurl() .. "/api/execute" })
+    end
+    return decoded, answer
+end
+
+-- Forgets a session the engine no longer holds, and raises a `sessionlost`
+-- error when it held something a fresh session would not have. Returns when
+-- `statement` may be sent again on a fresh session.
+function Connection:losesession(statement)
+    local hadtransaction = self.opentransaction
+    local hadcontext = self.touched
+    self:dropsession()
+    local context = { statement = statement, endpoint = self:baseurl() .. "/api/execute" }
+    if hadtransaction then
+        -- The transaction went with the session, so the connection is back in
+        -- autocommit mode, as the fresh session will be.
+        self.autocommit = true
+        errors.sessionlost("the engine no longer holds this connection's session (it "
+            .. "expired, was released, or the server restarted), so its open transaction "
+            .. "is gone; the statement did not run", context)
+    end
+    if hadcontext then
+        errors.sessionlost("the engine no longer holds this connection's session (it "
+            .. "expired, was released, or the server restarted), and the context set up on "
+            .. "it (USE, SET, ALTER SESSION or a temporary object) went with it, so the "
+            .. "statement was not run again; the next statement starts a fresh session on "
+            .. "the connection's scope", context)
+    end
+end
+
+-- Forgets the session id and what the driver knew of the session behind it, so
+-- the next statement starts a fresh one on the DSN's scope.
+function Connection:dropsession()
+    self.sessionid = nil
+    self:resetsession()
+end
+
+-- Back to what a fresh session holds: none of the caller's context, no
+-- transaction, and the DSN's scope still to apply.
+function Connection:resetsession()
+    self.touched = false
+    self.opentransaction = false
+    self.pending = {}
+    for i, statement in ipairs(self.defaults) do self.pending[i] = statement end
 end
 
 -- Sends one request, opening the socket if this connection has none and
@@ -506,6 +757,11 @@ function Connection:shapeone(entry)
                 nullable = flag(column, "nullable"),
                 precision = number(column, "precision"),
                 scale = number(column, "scale"),
+                -- The declared width of a text or binary column: characters
+                -- for VARCHAR, bytes for BINARY. Every other type sends none,
+                -- and so does an engine that predates the field -- nil, which
+                -- is what "the server did not say" reads as here.
+                length = number(column, "length"),
             }
         end
     end

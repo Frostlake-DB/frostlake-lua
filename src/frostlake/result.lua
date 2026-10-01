@@ -153,8 +153,10 @@ function Result:column(name)
 end
 
 -- The declared type of a column as the engine reports it: the base name --
--- "NUMBER", "VARCHAR", "TIMESTAMP_NTZ" -- with `precision` and `scale` carried
--- in the column's own entry rather than folded into the name.
+-- "NUMBER", "VARCHAR", "TIMESTAMP_NTZ" -- with `precision`, `scale` and
+-- `length` carried in the column's own entry rather than folded into the name.
+-- `length` is the declared width of a text or binary column, in characters for
+-- VARCHAR and bytes for BINARY; every other type leaves it nil.
 function Result:datatype(name)
     local at = self:columnindex(name)
     if not at then return nil end

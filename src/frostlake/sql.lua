@@ -20,8 +20,13 @@ local WORD = "[%w_%$]"
 local OBJECT_MODIFIERS = {
     OR = true, REPLACE = true, TRANSIENT = true, TEMPORARY = true, TEMP = true,
     VOLATILE = true, LOCAL = true, GLOBAL = true, SECURE = true,
-    IF = true, NOT = true, EXISTS = true,
+    IF = true, NOT = true, EXISTS = true, PUBLIC = true, PRIVATE = true,
+    ICEBERG = true, DYNAMIC = true, HYBRID = true, EVENT = true, RECURSIVE = true,
+    MATERIALIZED = true, EXTERNAL = true,
 }
+
+-- The modifiers that make a created object live and die with the session.
+local TEMPORARY = { TEMPORARY = true, TEMP = true, VOLATILE = true }
 
 local function iswordchar(c)
     return c ~= "" and c:match(WORD) ~= nil
@@ -198,7 +203,7 @@ local SCOPED = { DATABASE = true, SCHEMA = true }
 -- where it was, and counting those would mark the session dirty for every DDL
 -- statement a caller runs.
 local function statementchangesscope(statement)
-    local words = M.leadingwords(statement, 6)
+    local words = M.leadingwords(statement, 16)
     local first = words[1]
     if not first then return false end
     if first == "USE" or first == "SET" or first == "UNSET" then return true end
@@ -217,6 +222,40 @@ function M.changesscope(text)
         if statementchangesscope(statement) then return true end
     end
     return false
+end
+
+-- Whether one statement creates a temporary object -- `CREATE TEMPORARY TABLE`,
+-- `CREATE OR REPLACE LOCAL TEMP VIEW` -- which lives only as long as the session.
+local function createstemporary(statement)
+    local words = M.leadingwords(statement, 16)
+    if words[1] ~= "CREATE" then return false end
+    for i = 2, #words do
+        local word = words[i]
+        if not OBJECT_MODIFIERS[word] then return false end
+        if TEMPORARY[word] then return true end
+    end
+    return false
+end
+
+-- Whether one statement leaves behind state a fresh session would not have: a
+-- moved scope, a session variable or setting, or a temporary object.
+function M.touchessession(statement)
+    return statementchangesscope(statement) or createstemporary(statement)
+end
+
+local OPENS = { TRANSACTION = true, WORK = true, NAME = true }
+
+-- What one statement does to the session's transaction: "begins", "ends", or
+-- nil. `BEGIN` on its own -- or followed by TRANSACTION, WORK or NAME -- opens
+-- one, and so does `START TRANSACTION`; `BEGIN` followed by a statement opens a
+-- scripting block instead, which is no transaction at all.
+function M.transactioneffect(statement)
+    local words = M.leadingwords(statement, 2)
+    local first, second = words[1], words[2]
+    if first == "BEGIN" and (second == nil or OPENS[second]) then return "begins" end
+    if first == "START" and second == "TRANSACTION" then return "begins" end
+    if first == "COMMIT" or first == "ROLLBACK" then return "ends" end
+    return nil
 end
 
 return M

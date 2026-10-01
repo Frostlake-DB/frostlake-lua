@@ -12,7 +12,7 @@ Runs on Lua 5.1, 5.2, 5.3, 5.4 and LuaJIT.
 
 ## Engine version
 
-Requires a Frostlake engine **0.0.7 or newer**. Ask a running server which one it is with
+Requires a Frostlake engine **0.2.0 or newer**. Ask a running server which one it is with
 `SELECT CURRENT_VERSION()` — every release answers it, so the check works against any engine.
 
 The driver versions independently of the engine: it speaks the HTTP protocol, not the jar, so
@@ -28,12 +28,12 @@ That pulls in LuaSocket. For an `https://` DSN, add [LuaSec](https://github.com/
 as well (`luarocks install luasec`); it is not a hard dependency because it needs OpenSSL headers
 to build and only a TLS DSN uses it.
 
-Not published yet, so for now clone and install from the rockspec:
+To work from a checkout instead, install from the rockspec:
 
 ```bash
 git clone https://github.com/Frostlake-DB/frostlake-lua.git
 cd frostlake-lua
-luarocks make frostlake-0.1.0-1.rockspec
+luarocks make frostlake-0.2.0-1.rockspec
 ```
 
 ## Usage
@@ -87,7 +87,7 @@ goes in brackets: `frostlake://[::1]:18082`.
 | `warehouse` | warehouse to `USE` | — |
 | `timeout` | bound on a whole request | `300s` |
 | `connectTimeout` | bound on opening the socket | `10s` |
-| `idleLimit` | how long a session may sit idle before its scope is reapplied | `30m` |
+| `idleLimit` | how long a session may sit idle before its scope is reapplied, on an engine before 0.1.0 (see [Session lifetime](#session-lifetime)) | `30m` |
 | `tls` | force TLS on a `frostlake://` DSN | `false` |
 
 Durations are a bare number of seconds, or carry a unit: `30s`, `500ms`, `5m`, `1h`. Zero removes
@@ -196,8 +196,17 @@ The engine reports a base type name with `precision` and `scale` beside it rathe
 the name, so `datatype` is `"NUMBER"`, not `"NUMBER(38,0)"`. `frostlake.value.basetype` strips a
 `(p,s)` suffix anyway, for a query that produces one.
 
+A text or binary column carries its declared width beside them as `length` — characters for
+`VARCHAR`, bytes for `BINARY`, and `16777216` for an unbounded one, which is the most it could
+hold. Every other type has no width, and reports `nil` rather than `0`:
+
+```lua
+r.columns[2]   --> {name = "NAME", datatype = "VARCHAR", precision = 0, scale = 0, nullable = true, length = 9}
+```
+
 `conn:executeall(sql, params)` returns every result set a multi-statement request produced;
-`conn:execute` hands back the first.
+`conn:execute` hands back the first. The engine refuses a pack the caller did not ask for, as the
+account does, so ask first: `ALTER SESSION SET MULTI_STATEMENT_COUNT = n`, or `0` for any number.
 
 ### Cells are text
 
@@ -258,11 +267,55 @@ end)                -- rolls back and re-raises if the body fails
 A transaction lives on the *session*, so anything else run on the same connection meanwhile joins
 it. Give a transaction its own connection if that is not what you want.
 
-The engine reclaims a session after 30 minutes idle and then quietly builds a fresh one for the id
-the driver keeps sending — losing the scope the DSN selected, with nothing in the reply to say so.
-Past `idleLimit` the driver therefore reapplies the DSN's `USE` statements. It stops doing that
-once you have selected a scope yourself, because putting its defaults over your choice would be
-its own surprise.
+### Session lifetime
+
+A connection holds one engine session, named by the first answer (`conn:session()`), and every
+later request carries its id.
+
+**What is sent.** An engine from 0.1.0 on reports `newSession` in its answers, and the first answer
+that names a session tells the driver which kind it is talking to. From then on, every request that
+carries the id also carries `requireSession: true`: the engine resumes that session or refuses the
+request with a 404, and never runs the statement in a fresh session at its default scope. An older
+engine is never sent the field.
+
+**After a lost session.** A session goes when it idles past the engine's expiry (30 minutes), when
+something releases it, or when the server restarts. On the 404 the driver drops the id, and then:
+
+- if the session held nothing a fresh one lacks, the DSN's scope (`USE ROLE` / `WAREHOUSE` /
+  `DATABASE` / `SCHEMA`) goes on a fresh session and the statement is sent **once** more — the
+  caller sees only its result. A second 404 in a row raises a `sessionlost` error;
+- if a transaction was open — `conn:begin()`, or a `BEGIN` or `START TRANSACTION` statement — it
+  went with the session, and a `sessionlost` error says so. The statement did not run;
+- if the session had been moved or set up — `USE`, `SET`, `UNSET`, `ALTER SESSION`, a temporary
+  object, a `CREATE` or `DROP` of a database or schema — that context went with it, and a
+  `sessionlost` error says so rather than run the statement somewhere its author did not intend.
+  It did not run.
+
+Either way the connection stays usable: the next statement starts a fresh session on the DSN's
+scope. An older engine gives no such signal — it quietly rebuilds an expired session under the
+same id, at its default scope — so against one the driver reapplies the DSN's `USE` statements
+once a session has sat idle past `idleLimit`. It stops doing that once you have selected a scope
+yourself, because putting its defaults over your choice would be its own surprise.
+
+**On `close`.** The session is released with `DELETE /api/sessions/{id}`, which also rolls back a
+transaction left open on it. It is a courtesy: bounded by the shorter of the `timeout` and five
+seconds, and nothing it meets — a 404, a refusal, a server that is gone or never answers — is
+raised. A second `close` sends nothing. An older engine has no such endpoint and is sent nothing;
+its idle sweep reclaims the session.
+
+### Several statements in one request
+
+The engine refuses a request holding more statements than it was told to expect. `executeall`
+takes a `multistatementcount` option saying how many this one request holds:
+
+```lua
+local results = conn:executeall("SELECT 1; SELECT 2", nil, {multistatementcount = 2})
+```
+
+`0` means any number. The count travels with that one request and outranks the session's
+`MULTI_STATEMENT_COUNT` without changing it, so nothing has to be saved and put back, and two
+connections sharing nothing but the server cannot disturb each other. Leave the option out and no
+count is sent at all — the session's value decides, exactly as before.
 
 ## Errors
 
@@ -285,6 +338,7 @@ The table has a `__tostring`, so it still prints and concatenates as a message.
 | `usage` | the calling code is wrong: a malformed DSN, an unknown option, a bind count that does not match. Fix the program. |
 | `connection` | the server could not be reached, did not answer in time, or answered something that is not a Frostlake response. **The statement's fate is unknown** — it may well have run. |
 | `query` | the engine was reached, understood the statement, and refused it. The message is the engine's own. |
+| `sessionlost` | the engine no longer held the session, and an open transaction or a context set up on it went with it. **The statement did not run**; the connection carries on in a fresh session on the DSN's scope. See [Session lifetime](#session-lifetime). |
 
 `frostlake.iserror(e)` and `frostlake.iskind(e, "query")` tell one of these from anything else a
 `pcall` might have caught — a bug in the driver, an out-of-memory — which should not be swallowed
@@ -330,14 +384,17 @@ The unit suite needs **no rocks at all** — not even LuaSocket — because the 
 against the scripted transport. So it is also the portability check: the same command passes on
 `lua5.4` and on `luajit` with an empty `LUA_PATH`.
 
-With an engine classpath, the same command also boots a real `DatabaseHttpServer` and runs the
+With an engine classpath, the same command also boots a real `DatabaseHttpServer`, runs the
+session tests that need one (a session released behind a connection's back, and the release on
+`close`), and runs the
 engine-owned, language-neutral [testkit corpus](https://github.com/mlorek/frostlake) through
-this driver:
+this driver when `FL_CORPUS` names frostlake's `engine/src/test/resources/testkit`; without it
+the corpus is skipped:
 
 ```bash
 JAVA_HOME=/path/to/jdk \
 FROSTLAKE_CLASSPATH='/path/to/frostlake/lib/*' \
-FROSTLAKE_TESTKIT_SUITES=/path/to/frostlake/engine/src/test/resources/testkit/suites \
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
 lua tests/all.lua
 ```
 
@@ -357,7 +414,7 @@ that never reached an engine would be worse than a missing one. Results land in
 | `FROSTLAKE_CLASSPATH` | engine classpath; the harness boots a server of its own on a free port |
 | `FROSTLAKE_URL` | use an engine that is *already* running, and leave it running — takes precedence over booting one |
 | `FROSTLAKE_JAVA_OPTS` | extra JVM options for the server the harness boots |
-| `FROSTLAKE_TESTKIT_SUITES` | where the corpus is |
+| `FL_CORPUS` | the testkit directory whose `suites/*.json` the corpus replays (best absolute: a relative one is read from the working directory) |
 | `FROSTLAKE_TESTKIT_FILTER` | run only the suite files whose name contains this |
 | `FROSTLAKE_TESTKIT_FROM` / `_TO` | run a slice — a suite position, an exact suite name, or a name prefix |
 | `FROSTLAKE_TESTKIT_SESSION` | `suite` (default), `test`, or `run` — how much session one connection spans |

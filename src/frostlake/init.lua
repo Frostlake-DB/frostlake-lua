@@ -14,13 +14,13 @@
 -- which comes from LuaSocket, from OpenResty's cosockets, or from whatever the
 -- caller passes as the `transport` option -- see `transport.lua`.
 --
--- Failures are RAISED, as tables carrying a `kind` ("usage", "connection" or
--- "query") and a `message`. `pcall` hands the whole table back:
+-- Failures are RAISED, as tables carrying a `kind` ("usage", "connection",
+-- "query" or "sessionlost") and a `message`. `pcall` hands the whole table back:
 --
 --     local ok, err = pcall(conn.execute, conn, "SELECT * FROM missing")
 --     if not ok and err.kind == "query" then print(err.message) end
 --
--- See `errors.lua` for what the three kinds mean and why the difference
+-- See `errors.lua` for what the four kinds mean and why the difference
 -- matters.
 
 local connection = require("frostlake.connection")
@@ -36,12 +36,12 @@ local http = require("frostlake.http")
 
 local M = {}
 
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 -- The engine floor. The driver speaks the HTTP protocol rather than linking the
 -- jar, so this is a minimum rather than a lockstep pin; ask a running server
 -- which one it is with `SELECT CURRENT_VERSION()`.
-M.ENGINE_VERSION = "0.0.7"
+M.ENGINE_VERSION = "0.2.0"
 
 http.USER_AGENT = "frostlake-lua/" .. M.VERSION
 
